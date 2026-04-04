@@ -1,0 +1,54 @@
+server:
+  grpc_port: 50051
+  http_port: 8080
+
+kafka:
+  brokers:
+    - localhost:9092
+  order_topic: "matchengine-orders"
+  trade_topic: "matchengine-trades"
+  consumer_group: "matchengine-group"
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
+mysql:
+  host: "localhost"
+  port: 3306
+  user: "root"
+  password: "password"
+  database: "matchengine"
+
+raft:
+  node_id: 1
+  data_dir: "./data/raft"
+  peers:
+    - "node1:7000"
+    - "node2:7000"
+    - "node3:7000"
+
+log:
+  level: "info"
+  format: "json"
+
+markets:
+  - symbol: "BTC_USDT"
+    base_asset: "BTC"
+    quote_asset: "USDT"
+    base_precision: 8
+    quote_precision: 2
+    min_amount: "0.001"
+    min_total: "10"
+    price_tick: "0.01"
+    amount_tick: "0.0001"
+  - symbol: "ETH_USDT"
+    base_asset: "ETH"
+    quote_asset: "USDT"
+    base_precision: 8
+    quote_precision: 2
+    min_amount: "0.01"
+    min_total: "10"
+    price_tick: "0.01"
+    amount_tick: "0.0001"

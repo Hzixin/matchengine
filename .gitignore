@@ -1,0 +1,50 @@
+# Binaries
+matchengine
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+/bin/
+/dist/
+
+# Logs
+*.log
+
+# Data
+data/
+*.db
+
+# Environment
+.env
+.env.local
+
+# Temp
+tmp/
+temp/
