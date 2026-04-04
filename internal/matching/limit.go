@@ -24,6 +24,11 @@ func (m *LimitMatcher) Match(takerOrder *models.Order, ob *orderbook.OrderBook, 
 	result := models.NewTradeResult()
 	result.TakerOrder = takerOrder
 
+	// FOK订单：先检查是否能完全成交
+	if takerOrder.TimeInForce == models.TimeInForceFOK {
+		return m.matchFOK(takerOrder, ob, tradeIDGen)
+	}
+
 	// 撮合循环
 	for takerOrder.RemainAmount.GreaterThan(decimal.Zero) {
 		// 获取对手盘最优价
@@ -71,6 +76,74 @@ func (m *LimitMatcher) Match(takerOrder *models.Order, ob *orderbook.OrderBook, 
 		// GTX订单：只做Maker，不立即成交
 		if takerOrder.TimeInForce == models.TimeInForceGTX {
 			break
+		}
+	}
+
+	return result
+}
+
+// matchFOK FOK订单撮合
+func (m *LimitMatcher) matchFOK(takerOrder *models.Order, ob *orderbook.OrderBook, tradeIDGen func() uint64) *models.TradeResult {
+	result := models.NewTradeResult()
+	result.TakerOrder = takerOrder
+
+	// 先检查可用数量
+	availableAmount := decimal.Zero
+	remainAmount := takerOrder.RemainAmount
+
+	// 遍历对手盘计算可用数量
+	if takerOrder.IsBuy() {
+		ob.Asks.Ascend(func(price decimal.Decimal, level *orderbook.PriceLevel) bool {
+			if price.GreaterThan(takerOrder.Price) {
+				return false // 价格不满足
+			}
+			availableAmount = availableAmount.Add(level.Total)
+			return remainAmount.GreaterThan(availableAmount) // 继续直到足够
+		})
+	} else {
+		ob.Bids.Ascend(func(price decimal.Decimal, level *orderbook.PriceLevel) bool {
+			if price.LessThan(takerOrder.Price) {
+				return false // 价格不满足
+			}
+			availableAmount = availableAmount.Add(level.Total)
+			return remainAmount.GreaterThan(availableAmount)
+		})
+	}
+
+	// 如果可用数量不足，不成交
+	if availableAmount.LessThan(takerOrder.RemainAmount) {
+		return result
+	}
+
+	// 可用数量足够，执行撮合
+	for takerOrder.RemainAmount.GreaterThan(decimal.Zero) {
+		var bestLevel *orderbook.PriceLevel
+		if takerOrder.IsBuy() {
+			bestLevel = ob.Asks.Min()
+		} else {
+			bestLevel = ob.Bids.Max()
+		}
+
+		if bestLevel == nil {
+			break
+		}
+
+		// 检查价格
+		if takerOrder.IsBuy() && takerOrder.Price.LessThan(bestLevel.Price) {
+			break
+		}
+		if takerOrder.IsSell() && takerOrder.Price.GreaterThan(bestLevel.Price) {
+			break
+		}
+
+		empty := m.matchAtPriceLevel(takerOrder, bestLevel, result, tradeIDGen)
+
+		if empty {
+			if takerOrder.IsBuy() {
+				ob.Asks.Delete(bestLevel.Price)
+			} else {
+				ob.Bids.Delete(bestLevel.Price)
+			}
 		}
 	}
 

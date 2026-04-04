@@ -14,6 +14,14 @@ import (
 	"go.uber.org/zap"
 )
 
+// OrderApplier 订单应用接口
+// 由engine实现，状态机调用此接口来真正执行订单
+type OrderApplier interface {
+	ApplyOrder(order *models.Order) error
+	GetAllOrders() (map[string][]*models.Order, error) // 获取所有订单（用于快照）
+	RestoreOrders(orders map[string][]*models.Order) error // 恢复订单（从快照）
+}
+
 // RaftNode Raft节点
 type RaftNode struct {
 	raft      *raft.Raft
@@ -21,33 +29,25 @@ type RaftNode struct {
 	cfg       *config.RaftConfig
 	logger    *zap.Logger
 	nodeID    string
-	isLeader  bool
+	applier   OrderApplier
 	mu        sync.RWMutex
 }
 
 // MatchStateMachine 撮合状态机
 type MatchStateMachine struct {
-	// 订单簿快照
-	orderBooks map[string][]byte
-
-	// 最新成交价
-	lastPrices map[string]string
-
-	// 成交序列号
+	applier  OrderApplier
 	sequence uint64
-
-	mu sync.RWMutex
+	mu       sync.RWMutex
 }
 
 // NewMatchStateMachine 创建状态机
-func NewMatchStateMachine() *MatchStateMachine {
+func NewMatchStateMachine(applier OrderApplier) *MatchStateMachine {
 	return &MatchStateMachine{
-		orderBooks: make(map[string][]byte),
-		lastPrices: make(map[string]string),
+		applier: applier,
 	}
 }
 
-// Apply 应用日志
+// Apply 应用日志 - Raft共识成功后会调用此方法
 func (f *MatchStateMachine) Apply(log *raft.Log) interface{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -59,8 +59,19 @@ func (f *MatchStateMachine) Apply(log *raft.Log) interface{} {
 
 	switch cmd.Type {
 	case CommandTypeOrder:
-		// 应用订单到状态机
-		// 这里简化处理，实际应该重放订单
+		// 解析订单
+		var orderCmd OrderCommand
+		if err := json.Unmarshal(cmd.Data, &orderCmd); err != nil {
+			return err
+		}
+
+		// 真正执行订单！
+		if f.applier != nil {
+			if err := f.applier.ApplyOrder(orderCmd.Order); err != nil {
+				return err
+			}
+		}
+
 		f.sequence++
 		return f.sequence
 
@@ -70,8 +81,14 @@ func (f *MatchStateMachine) Apply(log *raft.Log) interface{} {
 		if err := json.Unmarshal(cmd.Data, &snapshot); err != nil {
 			return err
 		}
-		f.orderBooks = snapshot.OrderBooks
-		f.lastPrices = snapshot.LastPrices
+
+		// 恢复订单
+		if f.applier != nil {
+			if err := f.applier.RestoreOrders(snapshot.Orders); err != nil {
+				return err
+			}
+		}
+
 		f.sequence = snapshot.Sequence
 		return nil
 	}
@@ -84,10 +101,19 @@ func (f *MatchStateMachine) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
+	// 获取所有订单
+	orders := make(map[string][]*models.Order)
+	if f.applier != nil {
+		var err error
+		orders, err = f.applier.GetAllOrders()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &MatchSnapshot{
-		orderBooks: f.orderBooks,
-		lastPrices: f.lastPrices,
-		sequence:   f.sequence,
+		orders:   orders,
+		sequence: f.sequence,
 	}, nil
 }
 
@@ -102,26 +128,28 @@ func (f *MatchStateMachine) Restore(rc io.ReadCloser) error {
 		return err
 	}
 
-	f.orderBooks = snapshot.OrderBooks
-	f.lastPrices = snapshot.LastPrices
-	f.sequence = snapshot.Sequence
+	// 恢复订单
+	if f.applier != nil {
+		if err := f.applier.RestoreOrders(snapshot.Orders); err != nil {
+			return err
+		}
+	}
 
+	f.sequence = snapshot.Sequence
 	return nil
 }
 
 // MatchSnapshot 快照
 type MatchSnapshot struct {
-	orderBooks map[string][]byte
-	lastPrices map[string]string
-	sequence   uint64
+	orders   map[string][]*models.Order
+	sequence uint64
 }
 
 // Persist 持久化快照
 func (s *MatchSnapshot) Persist(sink raft.SnapshotSink) error {
 	err := json.NewEncoder(sink).Encode(&StateSnapshot{
-		OrderBooks: s.orderBooks,
-		LastPrices: s.lastPrices,
-		Sequence:   s.sequence,
+		Orders:   s.orders,
+		Sequence: s.sequence,
 	})
 	if err != nil {
 		sink.Cancel()
@@ -146,9 +174,8 @@ const (
 
 // StateSnapshot 状态快照
 type StateSnapshot struct {
-	OrderBooks map[string][]byte `json:"order_books"`
-	LastPrices map[string]string `json:"last_prices"`
-	Sequence   uint64            `json:"sequence"`
+	Orders   map[string][]*models.Order `json:"orders"`
+	Sequence uint64                     `json:"sequence"`
 }
 
 // OrderCommand 订单命令
@@ -157,8 +184,8 @@ type OrderCommand struct {
 }
 
 // NewRaftNode 创建Raft节点
-func NewRaftNode(cfg *config.RaftConfig, logger *zap.Logger) (*RaftNode, error) {
-	fsm := NewMatchStateMachine()
+func NewRaftNode(cfg *config.RaftConfig, logger *zap.Logger, applier OrderApplier) (*RaftNode, error) {
+	fsm := NewMatchStateMachine(applier)
 
 	nodeID := fmt.Sprintf("node-%d", cfg.NodeID)
 
@@ -196,11 +223,12 @@ func NewRaftNode(cfg *config.RaftConfig, logger *zap.Logger) (*RaftNode, error) 
 	}
 
 	node := &RaftNode{
-		raft:   r,
-		fsm:    fsm,
-		cfg:    cfg,
-		logger: logger,
-		nodeID: fmt.Sprintf("node%d", cfg.NodeID),
+		raft:    r,
+		fsm:     fsm,
+		cfg:     cfg,
+		logger:  logger,
+		nodeID:  nodeID,
+		applier: applier,
 	}
 
 	// 监听Leader变化
@@ -237,32 +265,28 @@ func (n *RaftNode) watchLeader() {
 		select {
 		case isLeader := <-n.raft.LeaderCh():
 			n.mu.Lock()
-			n.isLeader = isLeader
+			n.logger.Info("leadership changed",
+				zap.Bool("is_leader", isLeader),
+				zap.String("node_id", n.nodeID))
 			n.mu.Unlock()
-
-			if isLeader {
-				n.logger.Info("became leader", zap.String("node_id", n.nodeID))
-			} else {
-				n.logger.Info("lost leadership", zap.String("node_id", n.nodeID))
-			}
 		}
 	}
 }
 
 // IsLeader 是否是Leader
 func (n *RaftNode) IsLeader() bool {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.isLeader
+	return n.raft.State() == raft.Leader
 }
 
-// ProposeOrder 提交订单
+// ProposeOrder 提交订单到Raft共识
 func (n *RaftNode) ProposeOrder(order *models.Order) error {
+	// 包装成命令
 	cmd := Command{
 		Type: CommandTypeOrder,
 	}
 
-	data, err := json.Marshal(OrderCommand{Order: order})
+	orderCmd := OrderCommand{Order: order}
+	data, err := json.Marshal(orderCmd)
 	if err != nil {
 		return err
 	}
@@ -273,6 +297,7 @@ func (n *RaftNode) ProposeOrder(order *models.Order) error {
 		return err
 	}
 
+	// 提交到Raft，等待共识完成
 	future := n.raft.Apply(cmdData, 5*time.Second)
 	return future.Error()
 }
@@ -290,4 +315,11 @@ func (n *RaftNode) LeaderCh() <-chan bool {
 // Shutdown 关闭节点
 func (n *RaftNode) Shutdown() error {
 	return n.raft.Shutdown().Error()
+}
+
+// GetSequence 获取当前序列号
+func (n *RaftNode) GetSequence() uint64 {
+	n.fsm.mu.RLock()
+	defer n.fsm.mu.RUnlock()
+	return n.fsm.sequence
 }

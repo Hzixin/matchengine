@@ -9,16 +9,18 @@ import (
 	"github.com/hzx/matchengine/internal/matching"
 	"github.com/hzx/matchengine/internal/models"
 	"github.com/hzx/matchengine/internal/orderbook"
+	"github.com/hzx/matchengine/internal/raft"
 	"github.com/hzx/matchengine/pkg/utils"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 )
 
 var (
-	ErrEngineStopped = errors.New("engine stopped")
+	ErrEngineStopped  = errors.New("engine stopped")
 	ErrMarketNotFound = errors.New("market not found")
-	ErrInvalidOrder = errors.New("invalid order")
-	ErrOrderNotFound = errors.New("order not found")
+	ErrInvalidOrder   = errors.New("invalid order")
+	ErrOrderNotFound  = errors.New("order not found")
+	ErrNotLeader      = errors.New("not leader")
 )
 
 // Engine 撮合引擎
@@ -31,6 +33,12 @@ type Engine struct {
 
 	// ID生成器
 	idGenerator *utils.Snowflake
+
+	// Raft节点 (高可用)
+	raftNode *raft.RaftNode
+
+	// 是否启用Raft
+	enableRaft bool
 
 	// 状态
 	running bool
@@ -45,12 +53,12 @@ type MarketEngine struct {
 	IcebergMgr  *matching.IcebergOrderManager
 
 	// 撮合器
-	limitMatcher  *matching.LimitMatcher
-	marketMatcher *matching.MarketMatcher
-	stopMatcher   *matching.StopMatcher
+	limitMatcher   *matching.LimitMatcher
+	marketMatcher  *matching.MarketMatcher
+	stopMatcher    *matching.StopMatcher
 	icebergMatcher *matching.IcebergMatcher
 
-	// 订单通道
+	// 订单通道 (单机模式使用)
 	orderChan chan *models.Order
 
 	// 最新价格
@@ -58,6 +66,12 @@ type MarketEngine struct {
 
 	// ID生成器
 	idGenerator *utils.Snowflake
+
+	// 是否启用Raft
+	enableRaft bool
+
+	// 引擎引用 (用于Raft模式提交订单)
+	engine *Engine
 }
 
 // NewEngine 创建撮合引擎
@@ -66,7 +80,8 @@ func NewEngine(cfg *config.Config, logger *zap.Logger) *Engine {
 		cfg:         cfg,
 		logger:      logger,
 		markets:     make(map[string]*MarketEngine),
-		idGenerator: utils.NewSnowflake(1),
+		idGenerator: utils.NewSnowflake(int64(cfg.Raft.NodeID)),
+		enableRaft:  len(cfg.Raft.Peers) > 0,
 	}
 }
 
@@ -95,27 +110,43 @@ func (e *Engine) Start() error {
 		)
 
 		me := &MarketEngine{
-			Market:        market,
-			OrderBook:     orderbook.NewOrderBook(marketCfg.Symbol),
-			StopManager:   matching.NewStopOrderManager(),
-			IcebergMgr:    matching.NewIcebergOrderManager(),
-			limitMatcher:  matching.NewLimitMatcher(),
-			marketMatcher: matching.NewMarketMatcher(),
-			stopMatcher:   matching.NewStopMatcher(),
+			Market:         market,
+			OrderBook:      orderbook.NewOrderBook(marketCfg.Symbol),
+			StopManager:    matching.NewStopOrderManager(),
+			IcebergMgr:     matching.NewIcebergOrderManager(),
+			limitMatcher:   matching.NewLimitMatcher(),
+			marketMatcher:  matching.NewMarketMatcher(),
+			stopMatcher:    matching.NewStopMatcher(),
 			icebergMatcher: matching.NewIcebergMatcher(),
-			orderChan:     make(chan *models.Order, 10000),
-			lastPrice:     decimal.Zero,
-			idGenerator:   e.idGenerator,
+			lastPrice:      decimal.Zero,
+			idGenerator:    e.idGenerator,
+			enableRaft:     e.enableRaft,
+			engine:         e,
+		}
+
+		// 单机模式使用channel
+		if !e.enableRaft {
+			me.orderChan = make(chan *models.Order, 10000)
+			go me.processOrders()
 		}
 
 		e.markets[marketCfg.Symbol] = me
+	}
 
-		// 启动市场处理协程
-		go me.processOrders()
+	// 如果启用Raft，初始化Raft节点
+	if e.enableRaft {
+		raftNode, err := raft.NewRaftNode(&e.cfg.Raft, e.logger, e)
+		if err != nil {
+			return err
+		}
+		e.raftNode = raftNode
+		e.logger.Info("raft node started", zap.Uint64("node_id", e.cfg.Raft.NodeID))
 	}
 
 	e.running = true
-	e.logger.Info("matching engine started", zap.Int("markets", len(e.markets)))
+	e.logger.Info("matching engine started",
+		zap.Int("markets", len(e.markets)),
+		zap.Bool("raft_enabled", e.enableRaft))
 	return nil
 }
 
@@ -125,9 +156,18 @@ func (e *Engine) Stop() {
 	defer e.mu.Unlock()
 
 	e.running = false
-	for _, me := range e.markets {
-		close(me.orderChan)
+
+	// 单机模式关闭channel
+	if !e.enableRaft {
+		for _, me := range e.markets {
+			close(me.orderChan)
+		}
 	}
+
+	if e.raftNode != nil {
+		e.raftNode.Shutdown()
+	}
+
 	e.logger.Info("matching engine stopped")
 }
 
@@ -150,10 +190,101 @@ func (e *Engine) SubmitOrder(order *models.Order) error {
 		return ErrInvalidOrder
 	}
 
-	// 发送到订单通道
+	// Raft模式：通过共识
+	if e.enableRaft && e.raftNode != nil {
+		// 只有Leader可以提交订单
+		if !e.raftNode.IsLeader() {
+			return ErrNotLeader
+		}
+
+		// 通过Raft共识，共识成功后会调用ApplyOrder
+		if err := e.raftNode.ProposeOrder(order); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// 单机模式：直接发送到channel
 	me.orderChan <- order
+	return nil
+}
+
+// ApplyOrder 实现raft.OrderApplier接口 - Raft共识成功后调用
+func (e *Engine) ApplyOrder(order *models.Order) error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	me, exists := e.markets[order.Symbol]
+	if !exists {
+		return ErrMarketNotFound
+	}
+
+	// 直接处理订单（不经过channel）
+	me.processOrder(order)
+	return nil
+}
+
+// GetAllOrders 实现raft.OrderApplier接口 - 获取所有订单（用于快照）
+func (e *Engine) GetAllOrders() (map[string][]*models.Order, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	result := make(map[string][]*models.Order)
+	for symbol, me := range e.markets {
+		orders := make([]*models.Order, 0)
+		
+		// 遍历订单簿获取所有订单
+		me.OrderBook.AscendBids(func(price decimal.Decimal, level *orderbook.PriceLevel) bool {
+			// 从价格档位获取订单
+			for _, order := range level.GetOrders() {
+				orders = append(orders, order)
+			}
+			return true
+		})
+		
+		me.OrderBook.AscendAsks(func(price decimal.Decimal, level *orderbook.PriceLevel) bool {
+			for _, order := range level.GetOrders() {
+				orders = append(orders, order)
+			}
+			return true
+		})
+		
+		result[symbol] = orders
+	}
+	return result, nil
+}
+
+// RestoreOrders 实现raft.OrderApplier接口 - 恢复订单（从快照）
+func (e *Engine) RestoreOrders(orders map[string][]*models.Order) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// 清空现有订单簿
+	for _, me := range e.markets {
+		me.OrderBook = orderbook.NewOrderBook(me.Market.Symbol)
+	}
+
+	// 恢复订单
+	for symbol, orderList := range orders {
+		me, exists := e.markets[symbol]
+		if !exists {
+			continue
+		}
+
+		for _, order := range orderList {
+			me.OrderBook.AddOrder(order)
+		}
+	}
 
 	return nil
+}
+
+// IsLeader 是否是Leader节点
+func (e *Engine) IsLeader() bool {
+	if !e.enableRaft || e.raftNode == nil {
+		return true
+	}
+	return e.raftNode.IsLeader()
 }
 
 // CancelOrder 取消订单
@@ -224,7 +355,6 @@ func (e *Engine) GetTicker(symbol string) (*models.Ticker, error) {
 		Timestamp: time.Now().UnixMilli(),
 	}
 
-	// 获取买卖盘
 	bestBid := me.OrderBook.GetBestBid()
 	if bestBid != nil {
 		ticker.BidPrice = bestBid.Price
@@ -240,7 +370,7 @@ func (e *Engine) GetTicker(symbol string) (*models.Ticker, error) {
 	return ticker, nil
 }
 
-// processOrders 处理订单
+// processOrders 处理订单 (单机模式)
 func (me *MarketEngine) processOrders() {
 	for order := range me.orderChan {
 		me.processOrder(order)
@@ -263,11 +393,9 @@ func (me *MarketEngine) processOrder(order *models.Order) {
 	case models.OrderTypeMarket:
 		result = me.marketMatcher.Match(order, me.OrderBook, me.idGenerator.Generate)
 	case models.OrderTypeStopLimit, models.OrderTypeStopMarket:
-		// 止损单先加入管理器
 		me.StopManager.AddOrder(order)
 		return
 	case models.OrderTypeIceberg:
-		// 冰山单注册到管理器
 		me.IcebergMgr.Register(order, order.Visible)
 		result = me.icebergMatcher.Match(order, me.OrderBook, me.idGenerator.Generate)
 	default:
@@ -283,10 +411,8 @@ func (me *MarketEngine) processOrder(order *models.Order) {
 	// 未成交部分加入订单簿
 	if order.RemainAmount.GreaterThan(decimal.Zero) && !order.IsFinished() {
 		if order.Type == models.OrderTypeMarket {
-			// 市价单未成交部分取消
 			order.Status = models.OrderStatusCancelled
 		} else {
-			// 限价单加入订单簿
 			me.OrderBook.AddOrder(order)
 		}
 	}
@@ -295,23 +421,16 @@ func (me *MarketEngine) processOrder(order *models.Order) {
 // processTrades 处理成交
 func (me *MarketEngine) processTrades(result *models.TradeResult) {
 	for _, trade := range result.Trades {
-		// 更新最新价格
 		me.lastPrice = trade.Price
 
-		// 更新冰山单状态
 		if me.IcebergMgr.IsIcebergOrder(result.TakerOrder.ID) {
 			me.IcebergMgr.OnTrade(result.TakerOrder.ID, trade.Amount)
 		}
 		if me.IcebergMgr.IsIcebergOrder(result.MakerOrder.ID) {
 			me.IcebergMgr.OnTrade(result.MakerOrder.ID, trade.Amount)
 		}
-
-		// TODO: 发送成交消息到Kafka
-		// TODO: 更新Redis缓存
-		// TODO: 持久化到MySQL
 	}
 
-	// 检查止损单触发
 	me.checkStopOrders()
 }
 
@@ -321,15 +440,10 @@ func (me *MarketEngine) checkStopOrders() {
 		return
 	}
 
-	// 获取触发的止损单
 	triggeredOrders := me.StopManager.GetTriggeredOrders(me.lastPrice)
 
-	// 处理触发的止损单
 	for _, order := range triggeredOrders {
-		// 从止损管理器移除
 		me.StopManager.RemoveOrder(order)
-
-		// 重新提交到订单通道
-		me.orderChan <- order
+		me.processOrder(order) // 直接处理，不经过Raft（简化）
 	}
 }

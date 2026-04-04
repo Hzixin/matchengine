@@ -66,6 +66,17 @@ func (pl *PriceLevel) IsEmpty() bool {
 	return pl.Orders.Len() == 0
 }
 
+// GetOrders 获取价格档位所有订单
+func (pl *PriceLevel) GetOrders() []*models.Order {
+	orders := make([]*models.Order, 0, pl.Orders.Len())
+	for e := pl.Orders.Front(); e != nil; e = e.Next() {
+		if order, ok := e.Value.(*models.Order); ok {
+			orders = append(orders, order)
+		}
+	}
+	return orders
+}
+
 // OrderBook 订单簿
 type OrderBook struct {
 	Symbol string
@@ -263,4 +274,18 @@ func (ob *OrderBook) GetAskCount() int {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
 	return ob.Asks.Size()
+}
+
+// AscendBids 遍历买单（价格降序）
+func (ob *OrderBook) AscendBids(f func(price decimal.Decimal, level *PriceLevel) bool) {
+	ob.mu.RLock()
+	defer ob.mu.RUnlock()
+	ob.Bids.Ascend(f)
+}
+
+// AscendAsks 遍历卖单（价格升序）
+func (ob *OrderBook) AscendAsks(f func(price decimal.Decimal, level *PriceLevel) bool) {
+	ob.mu.RLock()
+	defer ob.mu.RUnlock()
+	ob.Asks.Ascend(f)
 }

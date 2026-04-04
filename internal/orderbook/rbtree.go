@@ -333,6 +333,14 @@ func (t *RBTree) Min() *PriceLevel {
 	if t.root == t.nilNode {
 		return nil
 	}
+	// 降序时，最小值在最右边
+	if t.desc {
+		node := t.root
+		for node.right != t.nilNode {
+			node = node.right
+		}
+		return node.value
+	}
 	node := t.minimum(t.root)
 	return node.value
 }
@@ -341,6 +349,14 @@ func (t *RBTree) Min() *PriceLevel {
 func (t *RBTree) Max() *PriceLevel {
 	if t.root == t.nilNode {
 		return nil
+	}
+	// 降序时，最大值在最左边
+	if t.desc {
+		node := t.root
+		for node.left != t.nilNode {
+			node = node.left
+		}
+		return node.value
 	}
 	node := t.maximum(t.root)
 	return node.value
