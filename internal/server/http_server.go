@@ -11,17 +11,25 @@ import (
 	"go.uber.org/zap"
 )
 
+// OrderQuerier 订单查询接口
+type OrderQuerier interface {
+	GetUserOrders(userID uint64, symbol string, limit int, offset int) ([]*models.Order, error)
+	GetTrades(symbol string, limit int, offset int) ([]*models.Trade, error)
+}
+
 // HTTPServer HTTP服务器
 type HTTPServer struct {
-	engine *engine.Engine
-	logger *zap.Logger
-	echo   *echo.Echo
+	engine  *engine.Engine
+	mysql   OrderQuerier
+	logger  *zap.Logger
+	echo    *echo.Echo
 }
 
 // NewEchoServer 创建Echo服务器
-func NewEchoServer(matchingEngine *engine.Engine, logger *zap.Logger) *echo.Echo {
+func NewEchoServer(matchingEngine *engine.Engine, db OrderQuerier, logger *zap.Logger) *echo.Echo {
 	s := &HTTPServer{
 		engine: matchingEngine,
+		mysql:  db,
 		logger: logger,
 		echo:   echo.New(),
 	}
@@ -146,9 +154,12 @@ func (s *HTTPServer) getUserOrders(c echo.Context) error {
 	if limit == 0 {
 		limit = 20
 	}
+	offset, _ := strconv.Atoi(c.QueryParam("offset"))
 
-	// TODO: 实现从数据库查询
-	orders := make([]*models.Order, 0)
+	orders, err := s.mysql.GetUserOrders(userID, symbol, limit, offset)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"user_id": userID,
@@ -192,9 +203,12 @@ func (s *HTTPServer) getTrades(c echo.Context) error {
 	if limit == 0 {
 		limit = 100
 	}
+	offset, _ := strconv.Atoi(c.QueryParam("offset"))
 
-	// TODO: 实现从数据库查询
-	trades := make([]*models.Trade, 0)
+	trades, err := s.mysql.GetTrades(symbol, limit, offset)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"symbol": symbol,
