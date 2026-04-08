@@ -10,11 +10,11 @@ import (
 const (
 	nodeBits       uint8 = 10
 	sequenceBits   uint8 = 12
-	nodeMax        int64 = -1 ^ (-1 << nodeBits)
-	sequenceMax    int64 = -1 ^ (-1 << sequenceBits)
-	nodeShift      uint8 = sequenceBits
-	timestampShift uint8 = sequenceBits + nodeBits
-	epoch          int64 = 1704067200000 // 2024-01-01 00:00:00 UTC
+	nodeMax        int64 = -1 ^ (-1 << nodeBits)     // 节点ID最大值 1023
+	sequenceMax    int64 = -1 ^ (-1 << sequenceBits) // 序列号最大值 4095
+	nodeShift      uint8 = sequenceBits              // 12
+	timestampShift uint8 = sequenceBits + nodeBits   // 22
+	epoch          int64 = 1704067200000             // 2024-01-01 00:00:00 UTC
 )
 
 // Snowflake 雪花算法ID生成器
@@ -27,7 +27,12 @@ type Snowflake struct {
 }
 
 // NewSnowflake 创建雪花算法生成器
+// 传入 nodeID 必须在 0 ~ 1023 之间
 func NewSnowflake(nodeID int64) *Snowflake {
+	// 新增：节点ID合法性校验，防止越界导致ID冲突
+	if nodeID < 0 || nodeID > nodeMax {
+		panic("nodeID must be between 0 and 1023")
+	}
 	return &Snowflake{
 		nodeID: nodeID,
 	}
@@ -40,19 +45,28 @@ func (s *Snowflake) Generate() uint64 {
 
 	now := time.Now().UnixMilli()
 
+	// 修复：防止系统时间回拨导致ID重复/乱序
+	if now < s.timestamp {
+		panic("clock moved backwards, refusing to generate id")
+	}
+
 	if now == s.timestamp {
+		// 同一毫秒内，序列号自增
 		s.sequence = (s.sequence + 1) & sequenceMax
+		// 序列号耗尽，等待下一毫秒
 		if s.sequence == 0 {
 			for now <= s.timestamp {
 				now = time.Now().UnixMilli()
 			}
 		}
 	} else {
+		// 新毫秒，重置序列号
 		s.sequence = 0
 	}
 
 	s.timestamp = now
 
+	// 位运算生成ID
 	id := ((now - epoch) << timestampShift) |
 		(s.nodeID << nodeShift) |
 		s.sequence

@@ -1,0 +1,200 @@
+syntax = "proto3";
+
+package matchengine;
+
+option go_package = "github.com/hzx/matchengine/proto";
+
+// MatchEngine 撮合引擎服务
+service MatchEngine {
+    // SubmitOrder 提交订单
+    rpc SubmitOrder(SubmitOrderRequest) returns (SubmitOrderResponse);
+    // CancelOrder 取消订单
+    rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+    // GetOrder 获取订单
+    rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+    // GetDepth 获取盘口深度
+    rpc GetDepth(GetDepthRequest) returns (GetDepthResponse);
+    // GetTicker 获取行情
+    rpc GetTicker(GetTickerRequest) returns (GetTickerResponse);
+    // GetTrades 获取成交记录
+    rpc GetTrades(GetTradesRequest) returns (GetTradesResponse);
+}
+
+// OrderSide 订单方向
+enum OrderSide {
+    ORDER_SIDE_UNKNOWN = 0;
+    ORDER_SIDE_BUY = 1;
+    ORDER_SIDE_SELL = 2;
+}
+
+// OrderType 订单类型
+enum OrderType {
+    ORDER_TYPE_UNKNOWN = 0;
+    ORDER_TYPE_LIMIT = 1;
+    ORDER_TYPE_MARKET = 2;
+    ORDER_TYPE_STOP_LIMIT = 3;
+    ORDER_TYPE_STOP_MARKET = 4;
+    ORDER_TYPE_ICEBERG = 5;
+}
+
+// OrderStatus 订单状态
+enum OrderStatus {
+    ORDER_STATUS_UNKNOWN = 0;
+    ORDER_STATUS_PENDING = 1;
+    ORDER_STATUS_PARTIAL = 2;
+    ORDER_STATUS_FILLED = 3;
+    ORDER_STATUS_CANCELLED = 4;
+    ORDER_STATUS_REJECTED = 5;
+}
+
+// TimeInForce 订单有效期类型
+enum TimeInForce {
+    TIME_IN_FORCE_UNKNOWN = 0;
+    TIME_IN_FORCE_GTC = 1; // Good Till Cancel
+    TIME_IN_FORCE_IOC = 2; // Immediate Or Cancel
+    TIME_IN_FORCE_FOK = 3; // Fill Or Kill
+    TIME_IN_FORCE_GTX = 4; // Good Till Crossing
+}
+
+// SubmitOrderRequest 提交订单请求
+message SubmitOrderRequest {
+    uint64 user_id = 1;
+    string symbol = 2;
+    OrderSide side = 3;
+    OrderType type = 4;
+    string price = 5;
+    string amount = 6;
+    TimeInForce time_in_force = 7;
+    string stop_price = 8;      // 止损单触发价格
+    string visible_amount = 9;  // 冰山单可见数量
+}
+
+// SubmitOrderResponse 提交订单响应
+message SubmitOrderResponse {
+    bool success = 1;
+    string error = 2;
+    Order order = 3;
+}
+
+// CancelOrderRequest 取消订单请求
+message CancelOrderRequest {
+    string symbol = 1;
+    uint64 order_id = 2;
+}
+
+// CancelOrderResponse 取消订单响应
+message CancelOrderResponse {
+    bool success = 1;
+    string error = 2;
+    Order order = 3;
+}
+
+// GetOrderRequest 获取订单请求
+message GetOrderRequest {
+    string symbol = 1;
+    uint64 order_id = 2;
+}
+
+// GetOrderResponse 获取订单响应
+message GetOrderResponse {
+    bool success = 1;
+    string error = 2;
+    Order order = 3;
+}
+
+// GetDepthRequest 获取盘口深度请求
+message GetDepthRequest {
+    string symbol = 1;
+    int32 limit = 2;
+}
+
+// GetDepthResponse 获取盘口深度响应
+message GetDepthResponse {
+    bool success = 1;
+    string error = 2;
+    string symbol = 3;
+    repeated DepthLevel bids = 4;
+    repeated DepthLevel asks = 5;
+}
+
+// DepthLevel 盘口价格档位
+message DepthLevel {
+    string price = 1;
+    string amount = 2;
+}
+
+// GetTickerRequest 获取行情请求
+message GetTickerRequest {
+    string symbol = 1;
+}
+
+// GetTickerResponse 获取行情响应
+message GetTickerResponse {
+    bool success = 1;
+    string error = 2;
+    Ticker ticker = 3;
+}
+
+// Ticker 行情
+message Ticker {
+    string symbol = 1;
+    string last_price = 2;
+    string bid_price = 3;
+    string bid_amount = 4;
+    string ask_price = 5;
+    string ask_amount = 6;
+    int64 timestamp = 7;
+}
+
+// GetTradesRequest 获取成交记录请求
+message GetTradesRequest {
+    string symbol = 1;
+    int32 limit = 2;
+    int32 offset = 3;
+}
+
+// GetTradesResponse 获取成交记录响应
+message GetTradesResponse {
+    bool success = 1;
+    string error = 2;
+    repeated Trade trades = 3;
+}
+
+// Trade 成交记录
+message Trade {
+    uint64 id = 1;
+    uint64 taker_order_id = 2;
+    uint64 maker_order_id = 3;
+    uint64 user_id = 4;
+    uint64 maker_user_id = 5;
+    string symbol = 6;
+    string price = 7;
+    string amount = 8;
+    string total = 9;
+    string fee = 10;
+    string fee_asset = 11;
+    OrderSide side = 12;
+    int64 created_at = 13;
+}
+
+// Order 订单
+message Order {
+    uint64 id = 1;
+    uint64 user_id = 2;
+    string symbol = 3;
+    OrderSide side = 4;
+    OrderType type = 5;
+    OrderStatus status = 6;
+    string price = 7;
+    string amount = 8;
+    string filled_amount = 9;
+    string remain_amount = 10;
+    string filled_total = 11;
+    string fee = 12;
+    string fee_asset = 13;
+    TimeInForce time_in_force = 14;
+    string stop_price = 15;
+    string visible_amount = 16;
+    int64 created_at = 17;
+    int64 updated_at = 18;
+}

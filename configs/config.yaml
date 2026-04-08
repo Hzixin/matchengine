@@ -8,6 +8,9 @@ kafka:
   order_topic: "matchengine-orders"
   trade_topic: "matchengine-trades"
   consumer_group: "matchengine-group"
+  enable_consumer: true
+  enable_producer: true
+  use_async_producer: true
 
 redis:
   addr: "localhost:6379"
@@ -24,10 +27,7 @@ mysql:
 raft:
   node_id: 1
   data_dir: "./data/raft"
-  peers:
-    - "node1:7000"
-    - "node2:7000"
-    - "node3:7000"
+  peers: []  # 单机模式,禁用 Raft
 
 log:
   level: "info"

@@ -20,10 +20,13 @@ type ServerConfig struct {
 }
 
 type KafkaConfig struct {
-	Brokers       []string `mapstructure:"brokers"`
-	OrderTopic    string   `mapstructure:"order_topic"`
-	TradeTopic    string   `mapstructure:"trade_topic"`
-	ConsumerGroup string   `mapstructure:"consumer_group"`
+	Brokers          []string `mapstructure:"brokers"`
+	OrderTopic       string   `mapstructure:"order_topic"`
+	TradeTopic       string   `mapstructure:"trade_topic"`
+	ConsumerGroup    string   `mapstructure:"consumer_group"`
+	EnableConsumer   bool     `mapstructure:"enable_consumer"`
+	EnableProducer   bool     `mapstructure:"enable_producer"`
+	UseAsyncProducer bool     `mapstructure:"use_async_producer"`
 }
 
 type RedisConfig struct {

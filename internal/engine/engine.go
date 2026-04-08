@@ -40,6 +40,9 @@ type Engine struct {
 	// 是否启用Raft
 	enableRaft bool
 
+	// 事件处理器链
+	eventHandler *EventHandlerChain
+
 	// 状态
 	running bool
 	mu      sync.RWMutex
@@ -72,16 +75,20 @@ type MarketEngine struct {
 
 	// 引擎引用 (用于Raft模式提交订单)
 	engine *Engine
+
+	// 事件处理器链
+	eventHandler *EventHandlerChain
 }
 
 // NewEngine 创建撮合引擎
-func NewEngine(cfg *config.Config, logger *zap.Logger) *Engine {
+func NewEngine(cfg *config.Config, logger *zap.Logger, eventHandler *EventHandlerChain) *Engine {
 	return &Engine{
-		cfg:         cfg,
-		logger:      logger,
-		markets:     make(map[string]*MarketEngine),
-		idGenerator: utils.NewSnowflake(int64(cfg.Raft.NodeID)),
-		enableRaft:  len(cfg.Raft.Peers) > 0,
+		cfg:          cfg,
+		logger:       logger,
+		markets:      make(map[string]*MarketEngine),
+		idGenerator:  utils.NewSnowflake(int64(cfg.Raft.NodeID)),
+		enableRaft:   len(cfg.Raft.Peers) > 0,
+		eventHandler: eventHandler,
 	}
 }
 
@@ -122,6 +129,7 @@ func (e *Engine) Start() error {
 			idGenerator:    e.idGenerator,
 			enableRaft:     e.enableRaft,
 			engine:         e,
+			eventHandler:   e.eventHandler,
 		}
 
 		// 单机模式使用channel
@@ -305,6 +313,11 @@ func (e *Engine) CancelOrder(symbol string, orderID uint64) (*models.Order, erro
 	order.Status = models.OrderStatusCancelled
 	order.UpdatedAt = time.Now()
 
+	// 触发订单取消事件
+	if e.eventHandler != nil {
+		e.eventHandler.OnOrderUpdate(order)
+	}
+
 	return order, nil
 }
 
@@ -412,8 +425,16 @@ func (me *MarketEngine) processOrder(order *models.Order) {
 	if order.RemainAmount.GreaterThan(decimal.Zero) && !order.IsFinished() {
 		if order.Type == models.OrderTypeMarket {
 			order.Status = models.OrderStatusCancelled
+			// 发送订单取消事件
+			if me.eventHandler != nil {
+				me.eventHandler.OnOrderUpdate(order)
+			}
 		} else {
 			me.OrderBook.AddOrder(order)
+			// 发送新订单事件
+			if me.eventHandler != nil {
+				me.eventHandler.OnOrderUpdate(order)
+			}
 		}
 	}
 }
@@ -423,11 +444,27 @@ func (me *MarketEngine) processTrades(result *models.TradeResult) {
 	for _, trade := range result.Trades {
 		me.lastPrice = trade.Price
 
+		// 触发成交事件
+		if me.eventHandler != nil {
+			me.eventHandler.OnTrade(trade)
+		}
+
+		// 处理冰山订单
 		if me.IcebergMgr.IsIcebergOrder(result.TakerOrder.ID) {
 			me.IcebergMgr.OnTrade(result.TakerOrder.ID, trade.Amount)
 		}
 		if me.IcebergMgr.IsIcebergOrder(result.MakerOrder.ID) {
 			me.IcebergMgr.OnTrade(result.MakerOrder.ID, trade.Amount)
+		}
+	}
+
+	// 触发订单更新事件
+	if me.eventHandler != nil && result.HasTrade() {
+		if result.TakerOrder != nil {
+			me.eventHandler.OnOrderUpdate(result.TakerOrder)
+		}
+		if result.MakerOrder != nil {
+			me.eventHandler.OnOrderUpdate(result.MakerOrder)
 		}
 	}
 
@@ -446,4 +483,9 @@ func (me *MarketEngine) checkStopOrders() {
 		me.StopManager.RemoveOrder(order)
 		me.processOrder(order) // 直接处理，不经过Raft（简化）
 	}
+}
+
+// HandleOrder 实现 consumer.OrderHandler 接口 - 从 Kafka 接收订单
+func (e *Engine) HandleOrder(order *models.Order) error {
+	return e.SubmitOrder(order)
 }

@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/hzx/matchengine/internal/config"
+	"github.com/hzx/matchengine/internal/consumer"
 	"github.com/hzx/matchengine/internal/engine"
+	"github.com/hzx/matchengine/internal/producer"
 	"github.com/hzx/matchengine/internal/server"
 	"github.com/hzx/matchengine/internal/storage"
 	"github.com/labstack/echo/v4"
@@ -50,8 +52,37 @@ func main() {
 	}
 	defer mysqlStorage.Close()
 
+	// 初始化 Kafka Producer (同步)
+	var kafkaProducer *producer.KafkaProducer
+	if cfg.Kafka.EnableProducer {
+		kafkaProducer, err = producer.NewKafkaProducer(&cfg.Kafka, logger)
+		if err != nil {
+			logger.Fatal("failed to init kafka producer", zap.Error(err))
+		}
+		defer kafkaProducer.Close()
+		logger.Info("kafka producer (sync) initialized")
+	}
+
+	// 初始化 Kafka Producer (异步) - 可选
+	var asyncKafkaProducer *producer.AsyncProducer
+	if cfg.Kafka.EnableProducer && cfg.Kafka.UseAsyncProducer {
+		asyncKafkaProducer, err = producer.NewAsyncProducer(&cfg.Kafka, logger)
+		if err != nil {
+			logger.Warn("failed to init async kafka producer, using sync mode", zap.Error(err))
+			asyncKafkaProducer = nil
+		} else {
+			defer asyncKafkaProducer.Close()
+			logger.Info("kafka producer (async) initialized")
+		}
+	}
+
+	// 创建事件处理器链
+	storageHandler := engine.NewStorageHandler(mysqlStorage, logger)
+	kafkaHandler := engine.NewKafkaHandler(kafkaProducer, asyncKafkaProducer, cfg.Kafka.UseAsyncProducer, logger)
+	eventChain := engine.NewEventHandlerChain(storageHandler, kafkaHandler)
+
 	// 创建撮合引擎
-	matchingEngine := engine.NewEngine(cfg, logger)
+	matchingEngine := engine.NewEngine(cfg, logger, eventChain)
 
 	// 启动撮合引擎
 	if err := matchingEngine.Start(); err != nil {
@@ -59,13 +90,24 @@ func main() {
 	}
 	defer matchingEngine.Stop()
 
+	// 启动 Kafka Consumer (如果启用)
+	var kafkaConsumer *consumer.KafkaConsumer
+	if cfg.Kafka.EnableConsumer {
+		kafkaConsumer, err = consumer.NewKafkaConsumer(&cfg.Kafka, logger, matchingEngine)
+		if err != nil {
+			logger.Fatal("failed to init kafka consumer", zap.Error(err))
+		}
+		defer kafkaConsumer.Close()
+		logger.Info("kafka consumer started")
+	}
+
 	// 启动gRPC服务
 	grpcListener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.Server.GRPCPort))
 	if err != nil {
 		logger.Fatal("failed to listen grpc", zap.Error(err))
 	}
 	grpcServer := grpc.NewServer()
-	server.RegisterGRPCServices(grpcServer, matchingEngine, logger)
+	server.RegisterGRPCServices(grpcServer, matchingEngine, mysqlStorage, logger)
 
 	go func() {
 		logger.Info("grpc server started", zap.Int("port", cfg.Server.GRPCPort))
